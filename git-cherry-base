@@ -1,0 +1,246 @@
+#!/bin/bash
+
+# The MIT License (MIT)
+#
+# Copyright (c) 2015 Robert Welin
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+set -e
+
+USAGE='[options] [action] <previous-base> <branch>...
+
+Cherry-pick <previous-base>..<b1>, <b1>..<b2>, ... onto current branch
+and reset each branch bN to the resulting revision of all cherry-picks
+up to and including that with argument <b(N-1)>..<bN>.
+
+Available options are
+    -h|--help           Print this message
+    -v|--verbose        Print more log messages of what is being done
+
+Actions:
+    -c|--continue       continue
+    -a|--abort          restore all affected branches and check out the original branch
+'
+
+name="$(basename $0)"
+state_dir=".git/cherry-base"
+todo_file="$state_dir/todo"
+done_file="$state_dir/done"
+branch_file="$state_dir/branches"
+head_file="$state_dir/head"
+initial_file="$state_dir/initial"
+
+verbose="false"
+do_continue="false"
+do_abort="false"
+
+function panic()
+{
+    echo "Panic! $@"
+    exit 1
+}
+
+function vecho()
+{
+    if [ "$verbose" = "true" ]
+    then
+        echo $@
+    fi
+}
+
+. git-sh-setup
+require_work_tree_exists
+require_clean_work_tree cherry-base-clean "Please commit or stash them."
+cd_to_toplevel
+
+ARGS=$(getopt -o "hvca" -l "help,verbose,continue,abort" -n "$NAME" -- "$@");
+
+eval set -- "$ARGS";
+
+while true
+do
+    case "$1" in
+        -h|--help)
+            usage
+            exit
+        ;;
+
+        -v|--verbose)
+            verbose="true"
+            shift
+        ;;
+            
+        -c|--continue)
+            do_continue="true"
+            shift
+        ;;
+
+        -a|--abort)
+            do_abort="true"
+            shift
+        ;;
+
+        --)
+            shift
+            break
+        ;;
+    esac
+done
+
+if [ "$do_continue" = "true" -a "$do_abort" = "true" ]
+then
+    usage
+    exit 1
+fi
+
+if [ "$do_abort" = "true" ]
+then
+    if [ -d "$state_dir" ]
+    then
+        if [ ! -f "$initial_file" ]
+        then
+            panic "Initial branch file does not exist."
+        fi
+
+        git checkout -q $(cat "$initial_file")
+        rm -r "$state_dir"
+        exit
+    else
+        echo "No cherry-base in progress?"
+        exit 1
+    fi
+fi
+
+if [ "$do_continue" = "true" ]
+then
+    if [ -d "$state_dir" ]
+    then
+        if [ ! -f "$head_file" ]
+        then
+            panic "Missing head file."
+        fi
+
+        if [ ! -f "$todo_file" ]
+        then
+            panic "Missing todo file."
+        fi
+
+        # This is a bit mysterious and might be wrong but this
+        # directory *seems* to exist during a cherry-pick and
+        # *seems* to not in normal conditions
+        if [ -d ".git/sequencer" ]
+        then
+            echo "You are currently chery-picking. Complete before issuing 'git cherry-base --continue'"
+        fi
+
+        git rev-parse HEAD >> "$done_file"
+        base_branch=$(cat "$head_file")
+    else
+        echo "No cherry-base in progress?"
+        exit 1
+    fi
+else
+    if [ $# -lt 1 ]
+    then
+        usage
+        exit 1
+    fi
+
+    base_branch="$1"
+    shift
+
+    if [ -d "$state_dir" ]
+    then
+        echo "Another cherry-base in progress? If not remove '$state_dir'."
+        exit 1
+    fi
+
+    mkdir "$state_dir"
+
+    git rev-parse --abbrev-ref HEAD > "$initial_file"
+
+    touch "$branch_file"
+
+    for b in $@
+    do
+        echo "$b" >> "$branch_file" 
+    done
+
+    cp "$branch_file" "$todo_file"
+
+    touch "$done_file"
+fi
+
+function remove_head()
+{
+    source_file="$1"
+    new_file="$source_file.new"
+    tail -n +2 "$source_file" > "$new_file"
+    mv "$new_file" "$source_file"
+}
+
+git checkout -q $(git rev-parse HEAD)
+
+for b in $(cat "$todo_file")
+do
+    echo "$b" > "$head_file"
+    remove_head "$todo_file"
+
+    base_hash=$(git rev-parse "$base_branch")
+    branch_hash=$(git rev-parse "$b")
+
+    if [ ! "$base_hash" = "$branch_hash" ]
+    then
+        if ! git cherry-pick $base_branch..$b
+        then
+            echo "Complete cherry-pick then do 'git cherry-base --continue' to continue or 'git cherry-base --abort'"
+            exit 1
+        fi
+    fi
+
+    git rev-parse HEAD >> "$done_file"
+    base_branch="$b"
+done
+
+function count_lines()
+{
+    cat "$1" | wc -l
+}
+
+num_branches=$(count_lines "$branch_file")
+num_done=$(count_lines "$done_file")
+
+if [ ! $num_branches -eq $num_done ]
+then
+    panic "Number of branches and number of done revisions are different."
+fi
+
+# Reset source branches to new revisions
+for i in $(seq 1 $num_branches)
+do
+    new_revision=$(head -1 "$done_file")
+    branch_name=$(head -1 "$branch_file")
+    git checkout "$branch_name"
+    git reset --hard "$new_revision"
+    remove_head "$branch_file"
+    remove_head "$done_file"
+done
+
+rm -r "$state_dir"
